@@ -1,0 +1,16 @@
+# Core vision + models
+torch>=2.2.0
+torchvision>=0.17.0
+timm>=0.9.12
+
+# UI
+gradio>=4.19.2
+
+# Data + plotting
+pandas>=2.1.0
+matplotlib>=3.7.0
+numpy>=1.24.0
+pillow>=10.0.0
+
+# Optional export targets
+onnx>=1.14.0
