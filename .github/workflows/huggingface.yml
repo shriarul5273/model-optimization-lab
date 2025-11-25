@@ -1,0 +1,25 @@
+name: Sync to Hugging Face hub
+on:
+  push:
+    branches: [main]
+
+  # to run this workflow manually from the Actions tab
+  workflow_dispatch:
+
+jobs:
+  sync-to-hub:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Add remote 
+        env:
+          HF: ${{secrets.HF_TOKEN }}
+          HFUSER: ${{secrets.HFUSER }}
+        run: git remote add space https://$HFUSER:$HF@huggingface.co/spaces/$HFUSER/model-optimization-lab
+      - name: Push to huggingface hub
+        env:
+          HF: ${{ secrets.HF_TOKEN}}
+          HFUSER: ${{secrets.HFUSER }}
+        run: git push --force https://$HFUSER:$HF@huggingface.co/spaces/$HFUSER/model-optimization-lab main
