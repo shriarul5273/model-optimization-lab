@@ -3,9 +3,7 @@ import io
 import json
 import os
 import time
-import zipfile
 from pathlib import Path
-from tempfile import TemporaryDirectory
 
 import matplotlib.pyplot as plt
 import gradio as gr
@@ -14,7 +12,6 @@ import pandas as pd
 import timm
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.nn.utils.prune as prune
 from PIL import Image
 from torchvision import transforms
@@ -170,64 +167,6 @@ def compute_sparsity(model: nn.Module) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def _macs_conv2d(inp, module: nn.Conv2d, out):
-    # inp: (N, C_in, H, W), out: (N, C_out, H_out, W_out)
-    batch, c_in, h, w = inp.shape
-    _, c_out, h_out, w_out = out.shape
-    kernel_ops = module.kernel_size[0] * module.kernel_size[1] * (c_in / module.groups)
-    return batch * h_out * w_out * c_out * kernel_ops
-
-
-def _macs_linear(inp, module: nn.Linear, out):
-    batch = inp.shape[0]
-    return batch * module.in_features * module.out_features
-
-
-def layer_profile(model: nn.Module, sample_input: torch.Tensor) -> pd.DataFrame:
-    """Collect per-layer params, MACs, and forward time (single run)."""
-    rows = []
-    handles = []
-    start_times = {}
-
-    def pre_hook(name):
-        def _pre(mod, inp):
-            start_times[name] = time.time()
-        return _pre
-
-    def fwd_hook(name):
-        def _fwd(mod, inp, out):
-            end = time.time()
-            duration_ms = (end - start_times.get(name, end)) * 1000
-            inp0 = inp[0] if isinstance(inp, (tuple, list)) else inp
-            macs = None
-            if isinstance(mod, nn.Conv2d):
-                macs = _macs_conv2d(inp0, mod, out)
-            elif isinstance(mod, nn.Linear):
-                macs = _macs_linear(inp0, mod, out)
-            params = sum(p.numel() for p in mod.parameters())
-            rows.append({
-                "Layer": name,
-                "Type": mod.__class__.__name__,
-                "Params": params,
-                "MACs": macs if macs is None else float(macs),
-                "Latency (ms)": round(duration_ms, 3),
-            })
-        return _fwd
-
-    for name, module in model.named_modules():
-        if len(list(module.children())) == 0:  # leaf
-            handles.append(module.register_forward_pre_hook(pre_hook(name)))
-            handles.append(module.register_forward_hook(fwd_hook(name)))
-
-    with torch.no_grad():
-        model(sample_input)
-
-    for h in handles:
-        h.remove()
-
-    return pd.DataFrame(rows)
-
-
 def maybe_compile(model, use_compile: bool):
     if not use_compile:
         return model
@@ -257,63 +196,6 @@ def prepare_image(image, transform_fn):
     image = image.convert("RGB")
     tensor = transform_fn(image).unsqueeze(0)
     return tensor
-
-
-def grad_cam(image, model, device, transform_fn):
-    model.eval()
-    target_layer = None
-    for m in reversed(list(model.modules())):
-        if isinstance(m, nn.Conv2d):
-            target_layer = m
-            break
-    if target_layer is None:
-        raise ValueError("No Conv2d layer found for Grad-CAM")
-
-    activations = {}
-    gradients = {}
-
-    def fwd_hook(module, inp, out):
-        activations["value"] = out.detach()
-
-    def bwd_hook(module, grad_in, grad_out):
-        gradients["value"] = grad_out[0].detach()
-
-    handle_fwd = target_layer.register_forward_hook(fwd_hook)
-    handle_bwd = target_layer.register_full_backward_hook(bwd_hook)
-
-    img_t = prepare_image(image, transform_fn).to(device)
-    img_t.requires_grad_(True)
-
-    with torch.no_grad():
-        pass
-
-    out = model(img_t)
-    top1 = out.argmax(dim=1)
-    score = out[0, top1]
-    model.zero_grad()
-    score.backward()
-
-    act = activations["value"]
-    grad = gradients["value"]
-    weights = grad.mean(dim=(2, 3), keepdim=True)
-    cam = (weights * act).sum(dim=1, keepdim=True)
-    cam = F.relu(cam)
-    cam = cam.squeeze().cpu().numpy()
-    cam -= cam.min()
-    cam /= cam.max() + 1e-8
-
-    # Resize CAM to image size
-    cam_img = Image.fromarray(np.uint8(cam * 255)).resize(image.size, resample=Image.BILINEAR)
-    heatmap = np.array(cam_img)
-    heatmap_rgb = np.stack([heatmap, np.zeros_like(heatmap), np.zeros_like(heatmap)], axis=-1)
-    overlay = np.array(image.convert("RGB"), dtype=np.float32)
-    alpha = 0.35
-    blended = (overlay * (1 - alpha) + heatmap_rgb * alpha).clip(0, 255).astype("uint8")
-    blended_img = Image.fromarray(blended)
-
-    handle_fwd.remove()
-    handle_bwd.remove()
-    return blended_img
 
 
 # ---------------------------------------------
@@ -632,187 +514,6 @@ def run_quantized(
 
     print("=== RUN QUANTIZED COMPLETE ===")
     return metrics_df, chart_fig, downloads
-
-
-def run_profile(image, model_name, variant, device_choice="auto"):
-    if image is None:
-        return pd.DataFrame()
-    device = select_device(device_choice)
-    if variant == "quant" and device.type != "cpu":
-        device = torch.device("cpu")
-    transform_fn = get_transform(model_name)
-    sample = prepare_image(image, transform_fn).to(device)
-
-    if variant == "fp32":
-        model = get_fp32_model(model_name).to(device)
-    elif variant == "pruned":
-        model = apply_pruning(clone_model(model_name), amount=0.4)
-    else:
-        model = apply_quantization(clone_model(model_name), "dynamic")
-
-    profile_df = layer_profile(model, sample)
-    return profile_df
-
-
-def run_batch(images, model_name, mode, device_choice="auto"):
-    """Batch runner: returns per-image metrics and aggregate stats."""
-    if not images:
-        return pd.DataFrame(), pd.DataFrame()
-
-    device = select_device(device_choice)
-    transform_fn = get_transform(model_name)
-
-    per_image = []
-    latencies = []
-    labels_map = {}
-    expanded_files = []
-    temp_dirs = []
-
-    for path in images:
-        if isinstance(path, str) and path.endswith(".zip"):
-            td = TemporaryDirectory()
-            temp_dirs.append(td)  # keep alive until function ends
-            with zipfile.ZipFile(path) as zf:
-                zf.extractall(td.name)
-            for root, _, files in os.walk(td.name):
-                for f in files:
-                    if f.lower().endswith((".jpg", ".jpeg", ".png")):
-                        expanded_files.append(os.path.join(root, f))
-                    if f.lower() in {"labels.txt", "labels.csv"}:
-                        with open(os.path.join(root, f)) as lf:
-                            for line in lf:
-                                parts = line.strip().split(",")
-                                if len(parts) >= 2:
-                                    labels_map[parts[0]] = parts[1]
-        else:
-            expanded_files.append(path)
-
-    for path in expanded_files:
-        img = Image.open(path) if isinstance(path, str) else path
-        if mode == "prune":
-            metrics, _, _, _ = run_pruned(
-                img,
-                model_name,
-                "structured",
-                0.4,
-                device_choice=device_choice,
-                export_state=False,
-            )
-            latency = float(metrics.loc[metrics["Metric"] == "Latency (ms)", "Pruned Model"].values[0])
-            top1 = metrics.loc[metrics["Metric"] == "Top-1 Prediction", "Pruned Model"].values[0]
-        else:
-            metrics, _, _ = run_quantized(
-                img,
-                model_name,
-                "dynamic",
-                device_choice=device_choice,
-                export_state=False,
-            )
-            latency = float(metrics.loc[metrics["Metric"] == "Latency (ms)", "Quantized Model"].values[0])
-            top1 = metrics.loc[metrics["Metric"] == "Top-1 Prediction", "Quantized Model"].values[0]
-
-        fname = os.path.basename(getattr(path, "name", path))
-        record = {"Image": fname, "Top-1": top1, "Latency (ms)": latency}
-        if fname in labels_map:
-            record["Label"] = labels_map[fname]
-            record["Correct"] = labels_map[fname] == top1
-        per_image.append(record)
-        latencies.append(latency)
-
-    per_image_df = pd.DataFrame(per_image)
-    summary = {
-        "count": len(latencies),
-        "mean_latency": float(np.mean(latencies)),
-        "median_latency": float(np.median(latencies)),
-        "max_latency": float(np.max(latencies)),
-    }
-    if "Correct" in per_image_df.columns:
-        summary["accuracy"] = float(per_image_df["Correct"].mean())
-
-    summary_df = pd.DataFrame({"Metric": list(summary.keys()), "Value": list(summary.values())})
-    return per_image_df, summary_df
-
-
-def run_sweep(img, model_name, device_choice, experiments_json=None):
-    if img is None:
-        return pd.DataFrame(), pd.DataFrame()
-    default_experiments = [
-        {"mode": "prune", "amount": 0.2, "method": "structured"},
-        {"mode": "prune", "amount": 0.5, "method": "structured"},
-        {"mode": "quant", "q_type": "dynamic"},
-        {"mode": "quant", "q_type": "fp16"},
-    ]
-    try:
-        experiments = json.loads(experiments_json) if experiments_json else default_experiments
-    except Exception:
-        experiments = default_experiments
-
-    rows = []
-    for exp in experiments:
-        if exp.get("mode") == "prune":
-            metrics, _, _, _ = run_pruned(
-                img,
-                model_name,
-                exp.get("method", "structured"),
-                exp.get("amount", 0.4),
-                device_choice=device_choice,
-                export_state=False,
-            )
-            latency = float(metrics.loc[metrics["Metric"] == "Latency (ms)", "Pruned Model"].values[0])
-            size = float(metrics.loc[metrics["Metric"] == "Model Size (MB)", "Pruned Model"].values[0])
-            top1 = metrics.loc[metrics["Metric"] == "Top-1 Prediction", "Pruned Model"].values[0]
-            rows.append({"mode": "prune", "amount": exp.get("amount"), "latency": latency, "size": size, "top1": top1})
-        else:
-            metrics, _, _ = run_quantized(
-                img,
-                model_name,
-                exp.get("q_type", "dynamic"),
-                device_choice=device_choice,
-                export_state=False,
-            )
-            latency = float(metrics.loc[metrics["Metric"] == "Latency (ms)", "Quantized Model"].values[0])
-            size = float(metrics.loc[metrics["Metric"] == "Model Size (MB)", "Quantized Model"].values[0])
-            top1 = metrics.loc[metrics["Metric"] == "Top-1 Prediction", "Quantized Model"].values[0]
-            rows.append({"mode": "quant", "q_type": exp.get("q_type"), "latency": latency, "size": size, "top1": top1})
-
-    df = pd.DataFrame(rows)
-    pareto_df = df.rename(columns={"latency": "Latency (ms)", "size": "Model Size (MB)", "top1": "Top-1"})
-    return df, pareto_df
-
-
-def fastapi_snippet():
-    return """
-from fastapi import FastAPI, UploadFile
-from PIL import Image
-import io, torch, timm
-from app import get_transform, get_fp32_model, run_inference, select_device
-
-app = FastAPI()
-MODEL = "resnet50"
-DEVICE = select_device("auto")
-MODEL_OBJ = get_fp32_model(MODEL).to(DEVICE)
-TRANSFORM = get_transform(MODEL)
-
-
-@app.post('/predict')
-async def predict(file: UploadFile):
-    img = Image.open(io.BytesIO(await file.read())).convert("RGB")
-    results, latency = run_inference(MODEL_OBJ, img, DEVICE, TRANSFORM)
-    return {"top1": results[0][0], "confidence": results[0][1], "latency_ms": latency}
-"""
-
-
-def dockerfile_snippet():
-    return """
-FROM python:3.10-slim
-WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-COPY . .
-CMD ["python", "app.py", "--cli", "--image", "examples/cat.jpg"]
-"""
-
-
 # ---------------------------------------------
 # GRADIO UI
 # ---------------------------------------------
@@ -849,6 +550,15 @@ def create_demo():
                         export_report_p = gr.Checkbox(label="Export JSON report", value=True)
                         btn_p = gr.Button("Run Pruned Model")
                         gr.Examples(examples=examples, inputs=img_p)
+                        gr.Markdown(
+                            "**Option Guide**\n"
+                            "- Base Model: select the timm architecture to optimize (pretrained when available).\n"
+                            "- Hardware Preset: load device, precision, and pruning defaults for common targets; choose custom to tweak manually.\n"
+                            "- Pruning Method/Amount: set structured vs unstructured pruning and the fraction of weights removed.\n"
+                            "- Device & CUDA Toggles: force CPU/CUDA/MPS and optionally enable channels-last or AMP for CUDA speedups.\n"
+                            "- Torch compile: wrap the model with torch.compile (PyTorch 2) to experiment with graph optimizations.\n"
+                            "- Export options: drop TorchScript, ONNX, and JSON reports into the `exports/` directory."
+                        )
 
                     with gr.Column():
                         metrics_p = gr.Dataframe(label="📊 Comparison Metrics", headers=["Metric", "Original Model", "Pruned Model"])
@@ -893,6 +603,15 @@ def create_demo():
                         export_report_q = gr.Checkbox(label="Export JSON report", value=True)
                         btn_q = gr.Button("Run Quantized Model")
                         gr.Examples(examples=examples, inputs=img_q)
+                        gr.Markdown(
+                            "**Option Guide**\n"
+                            "- Base Model & Preset: pick the architecture and optional hardware profile to prefill device and quant settings.\n"
+                            "- Quantization Type: `dynamic` applies post-training int8 to linear layers (forces CPU kernels), `weight_only` stores int8 weights with fp32 activations for a lighter CPU model, while `fp16` casts the full network to half precision for GPUs with native fp16 support.\n"
+                            "- Device & CUDA Toggles: run on CPU/CUDA/MPS; channels-last and AMP only benefit CUDA workloads.\n"
+                            "- Torch compile: try PyTorch 2 compile for extra speed when supported.\n"
+                            "- Export options: generate TorchScript, ONNX, and JSON artifacts inside `exports/`."
+                        )
+                        
 
                     with gr.Column():
                         metrics_q = gr.Dataframe(label="📊 Comparison Metrics", headers=["Metric", "Original Model", "Quantized Model"])

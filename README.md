@@ -18,6 +18,7 @@ Interactive Gradio playground for comparing pruning and quantization on ImageNet
 - Pruning tab: structured/unstructured pruning with configurable sparsity and size/latency comparison.
 - Quantization tab: dynamic, weight-only INT8, and FP16 passes with CPU-safe fallbacks for unsupported kernels.
 - Automated metric tables and Top-5 bar charts to visualize confidence shifts between optimized variants.
+- Lightweight CLI mode for quick experiments without launching the UI.
 
 ## Requirements
 - Python 3.9+
