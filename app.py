@@ -1,4 +1,5 @@
 import argparse
+import copy
 import io
 import json
 import os
@@ -17,6 +18,16 @@ import torch.nn.utils.prune as prune
 import segmentation_models_pytorch as smp
 from PIL import Image, ImageDraw, ImageFont
 from torchvision import transforms
+from torchvision.models.detection import (
+    FasterRCNN_ResNet50_FPN_Weights,
+    SSDLite320_MobileNet_V3_Large_Weights,
+    fasterrcnn_resnet50_fpn,
+    ssdlite320_mobilenet_v3_large,
+)
+try:
+    from ultralytics import YOLO as UltralyticsYOLO
+except ModuleNotFoundError:  # pragma: no cover - optional dependency
+    UltralyticsYOLO = None
 try:
     import albumentations as A
 except ModuleNotFoundError:  # pragma: no cover - optional dependency
@@ -129,6 +140,46 @@ ADE20K_CLASS_NAMES = [
     "screen", "blanket", "sculpture", "hood", "sconce", "vase", "traffic light", "tray", "ashcan", "fan",
     "pier", "crt screen", "plate", "monitor", "bulletin board", "shower", "radiator", "glass", "clock", "flag"
 ]
+
+
+# ---------------------------------------------
+# Object Detection Registry / Defaults
+# ---------------------------------------------
+DETECTION_MODEL_CONFIGS = {
+    "Faster R-CNN ResNet50 FPN (COCO)": {
+        "builder": fasterrcnn_resnet50_fpn,
+        "weights": FasterRCNN_ResNet50_FPN_Weights.DEFAULT,
+        "backend": "torchvision",
+    },
+    "SSDlite320 MobileNetV3 (COCO)": {
+        "builder": ssdlite320_mobilenet_v3_large,
+        "weights": SSDLite320_MobileNet_V3_Large_Weights.DEFAULT,
+        "backend": "torchvision",
+    },
+}
+COCO_CATEGORIES = list(FasterRCNN_ResNet50_FPN_Weights.DEFAULT.meta.get("categories", []))
+
+# Optional YOLOv12 variants (Ultralytics) with size options: n/s/m/l/x
+for _size in ("n", "s", "m", "l", "x"):
+    DETECTION_MODEL_CONFIGS[f"YOLO12-{_size} (COCO)"] = {
+        "backend": "ultralytics",
+        "weights": f"yolo12{_size}.pt",
+        "imgsz": 640,
+        "categories": COCO_CATEGORIES,
+    }
+DETECTION_MODEL_OPTIONS = list(DETECTION_MODEL_CONFIGS.keys())
+
+_DET_MODEL_CACHE: dict[str, nn.Module] = {}
+_DET_TRANSFORM_CACHE: dict[str, object] = {}
+_DET_LABELS_CACHE: dict[str, list[str]] = {}
+
+
+def _require_ultralytics():
+    if UltralyticsYOLO is None:
+        raise RuntimeError(
+            "The 'ultralytics' package is required for YOLO12 models. "
+            "Install it with `pip install ultralytics` to enable these options."
+        )
 
 
 def add_image_label(img: Image.Image, label: str) -> Image.Image:
@@ -352,6 +403,304 @@ def get_class_labels(config: SegmentationModelConfig) -> list[str]:
     if len(labels) < config.classes:
         labels.extend(f"Class {len(labels) + i}" for i in range(config.classes - len(labels)))
     return labels[: config.classes]
+
+
+# ---------------------------------------------
+# Object Detection Utilities
+# ---------------------------------------------
+def get_detection_config(model_name: str) -> dict:
+    if model_name not in DETECTION_MODEL_CONFIGS:
+        raise ValueError(f"Unknown detection model: {model_name}")
+    return dict(DETECTION_MODEL_CONFIGS[model_name])
+
+
+def get_detection_labels(model_name: str) -> list[str]:
+    if model_name in _DET_LABELS_CACHE:
+        return _DET_LABELS_CACHE[model_name]
+    cfg = get_detection_config(model_name)
+    categories = cfg.get("categories")
+    if categories:
+        labels = categories
+    else:
+        weights = cfg.get("weights")
+        labels = weights.meta.get("categories", []) if weights else []
+    _DET_LABELS_CACHE[model_name] = list(labels)
+    return _DET_LABELS_CACHE[model_name]
+
+
+def get_detection_transform(model_name: str):
+    if model_name in _DET_TRANSFORM_CACHE:
+        return _DET_TRANSFORM_CACHE[model_name]
+    cfg = get_detection_config(model_name)
+    backend = cfg.get("backend", "torchvision")
+    if backend == "ultralytics":
+        transform = lambda img: img  # Ultralytics handles preprocessing internally
+    else:
+        weights = cfg.get("weights")
+        transform = weights.transforms() if weights else transforms.Compose([transforms.ToTensor()])
+    _DET_TRANSFORM_CACHE[model_name] = transform
+    return transform
+
+
+def get_detection_model(model_name: str) -> nn.Module:
+    if model_name not in _DET_MODEL_CACHE:
+        cfg = get_detection_config(model_name)
+        backend = cfg.get("backend", "torchvision")
+        if backend == "ultralytics":
+            _require_ultralytics()
+            weights = cfg.get("weights")
+            try:
+                model = UltralyticsYOLO(weights)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Failed to load YOLO12 weights '{weights}'. Download or place the checkpoint locally first."
+                ) from exc
+            if hasattr(model, "model"):
+                model.model.eval()
+        else:
+            weights = cfg.get("weights")
+            try:
+                model = cfg["builder"](weights=weights)
+            except Exception as exc:
+                print(f"Warning: detection weights unavailable ({exc}); using random init for {model_name}")
+                model = cfg["builder"](weights=None)
+            model.eval()
+        _DET_MODEL_CACHE[model_name] = model
+    return _DET_MODEL_CACHE[model_name]
+
+
+def clone_detection_model(model_name: str) -> nn.Module:
+    base = get_detection_model(model_name)
+    cfg = get_detection_config(model_name)
+    backend = cfg.get("backend", "torchvision")
+    if backend == "ultralytics":
+        _require_ultralytics()
+        fresh = copy.deepcopy(base)
+        if hasattr(fresh, "model") and isinstance(fresh.model, nn.Module):
+            fresh.model.eval()
+        return fresh
+
+    fresh = cfg["builder"](weights=None)
+    fresh.load_state_dict(base.state_dict())
+    fresh.eval()
+    return fresh
+
+
+def prepare_detection_input(image, transform_fn):
+    if image is None:
+        raise ValueError("No image provided")
+    if not isinstance(image, Image.Image):
+        if isinstance(image, np.ndarray) and image.dtype != np.uint8:
+            image = (np.clip(image, 0, 1) * 255).astype(np.uint8)
+        image = Image.fromarray(np.array(image).astype("uint8"))
+    image_rgb = image.convert("RGB")
+    tensor = transform_fn(image_rgb)
+    if tensor.ndim == 3:
+        tensor = tensor
+    else:
+        tensor = torch.as_tensor(tensor)
+    return tensor, image_rgb
+
+
+def draw_detections(image: Image.Image, detections: list[dict], max_dets: int = 30) -> Image.Image:
+    canvas = image.copy()
+    draw = ImageDraw.Draw(canvas)
+    colors = _SEG_BASE_PALETTE  # reuse palette for variety
+    for idx, det in enumerate(detections[:max_dets]):
+        box = det["box"]
+        color = tuple(int(c) for c in colors[idx % len(colors)])
+        draw.rectangle(box, outline=color, width=3)
+        label = f"{det['label']} {det['score']:.2f}"
+        draw.text((box[0] + 4, box[1] + 4), label, fill=color)
+    return canvas
+
+
+def run_detection_inference(
+    model: nn.Module,
+    image,
+    device: torch.device,
+    transform_fn,
+    channels_last: bool,
+    warmup: bool,
+    use_amp: bool,
+    score_thresh: float = 0.25,
+    backend: str = "torchvision",
+    imgsz: int | None = None,
+):
+    if backend == "ultralytics":
+        if image is None:
+            raise ValueError("No image provided")
+        if not isinstance(image, Image.Image):
+            if isinstance(image, np.ndarray) and image.dtype != np.uint8:
+                image = (np.clip(image, 0, 1) * 255).astype(np.uint8)
+            image = Image.fromarray(np.array(image).astype("uint8"))
+        image_rgb = image.convert("RGB")
+
+        device_arg = str(device) if isinstance(device, torch.device) else device
+        half = use_amp and isinstance(device, torch.device) and device.type == "cuda"
+        if hasattr(model, "model") and isinstance(model.model, nn.Module):
+            model.model.to(device)
+
+        if warmup:
+            with torch.no_grad():
+                model.predict(image_rgb, imgsz=imgsz, device=device_arg, verbose=False, half=half)
+
+        start = time.time()
+        with torch.no_grad():
+            results = model.predict(image_rgb, imgsz=imgsz, device=device_arg, verbose=False, half=half)
+        latency = (time.time() - start) * 1000
+
+        dets: list[dict] = []
+        if results:
+            res = results[0]
+            boxes = getattr(res, "boxes", None)
+            if boxes is not None:
+                xyxy = boxes.xyxy.detach().cpu().numpy()
+                confs = boxes.conf.detach().cpu().numpy()
+                labels = boxes.cls.detach().cpu().numpy()
+                for box, score, label_idx in zip(xyxy, confs, labels):
+                    if score < score_thresh:
+                        continue
+                    dets.append(
+                        {
+                            "label": str(int(label_idx)),
+                            "score": float(score),
+                            "box": [float(x) for x in box],
+                        }
+                    )
+
+        return {"detections": dets, "latency": latency, "image": image_rgb}
+
+    tensor, image_rgb = prepare_detection_input(image, transform_fn)
+    model = model.to(device)
+
+    batch_tensor = tensor.to(device)
+    if channels_last and device.type == "cuda" and batch_tensor.dim() == 4:
+        batch_tensor = batch_tensor.to(memory_format=torch.channels_last)
+    elif channels_last and device.type == "cuda":
+        # Channels-last requires NCHW (4D) input; detection tensors are 3D.
+        pass
+
+    if next(model.parameters()).dtype == torch.float16:
+        batch_tensor = batch_tensor.half()
+
+    inputs = [batch_tensor]
+
+    if warmup:
+        with torch.no_grad():
+            model(inputs)
+
+    amp_ctx = torch.cuda.amp.autocast(enabled=use_amp and device.type == "cuda")
+    start = time.time()
+    with torch.no_grad(), amp_ctx:
+        outputs = model(inputs)
+    latency = (time.time() - start) * 1000
+
+    out = outputs[0]
+    boxes = out["boxes"].detach().cpu().numpy()
+    scores = out["scores"].detach().cpu().numpy()
+    labels = out["labels"].detach().cpu().numpy()
+
+    dets = []
+    for box, score, label_idx in zip(boxes, scores, labels):
+        if score < score_thresh:
+            continue
+        dets.append(
+            {
+                "label": str(label_idx),
+                "score": float(score),
+                "box": [float(x) for x in box],
+            }
+        )
+
+    return {
+        "detections": dets,
+        "latency": latency,
+        "image": image_rgb,
+    }
+
+
+def attach_detection_labels(detections: list[dict], label_names: list[str]) -> list[dict]:
+    labeled = []
+    for det in detections:
+        idx = int(det["label"])
+        name = label_names[idx] if idx < len(label_names) else f"Class {idx}"
+        labeled.append({**det, "label": name})
+    return labeled
+
+
+def get_detection_state_module(model, backend: str):
+    if backend == "ultralytics" and hasattr(model, "model"):
+        return model.model
+    return model
+
+
+def build_detection_metrics(
+    original_result: dict,
+    optimized_result: dict,
+    size_original: float,
+    size_optimized: float,
+    optimized_label: str,
+    score_thresh: float,
+):
+    orig_dets = original_result["detections"]
+    opt_dets = optimized_result["detections"]
+    mean_score_orig = float(np.mean([d["score"] for d in orig_dets])) if orig_dets else 0.0
+    mean_score_opt = float(np.mean([d["score"] for d in opt_dets])) if opt_dets else 0.0
+
+    metrics_df = pd.DataFrame(
+        {
+            "Metric": [
+                "Latency (ms)",
+                f"Detections (score>={score_thresh})",
+                "Mean Score",
+                "Model Size (MB)",
+            ],
+            "Original Model": [
+                f"{original_result['latency']:.2f}",
+                str(len(orig_dets)),
+                f"{mean_score_orig:.3f}",
+                f"{size_original:.2f}",
+            ],
+            optimized_label: [
+                f"{optimized_result['latency']:.2f}",
+                str(len(opt_dets)),
+                f"{mean_score_opt:.3f}",
+                f"{size_optimized:.2f}",
+            ],
+        }
+    )
+    return metrics_df
+
+
+def build_detection_comparison_df(
+    orig_dets: list[dict],
+    opt_dets: list[dict],
+    optimized_label: str,
+    max_rows: int = 50,
+) -> pd.DataFrame:
+    rows = []
+    for det in orig_dets:
+        rows.append(
+            {
+                "Model": "Original",
+                "Class": det["label"],
+                "Score": round(det["score"], 3),
+                "Box [x1,y1,x2,y2]": [round(x, 1) for x in det["box"]],
+            }
+        )
+    for det in opt_dets:
+        rows.append(
+            {
+                "Model": optimized_label,
+                "Class": det["label"],
+                "Score": round(det["score"], 3),
+                "Box [x1,y1,x2,y2]": [round(x, 1) for x in det["box"]],
+            }
+        )
+    if max_rows and len(rows) > max_rows:
+        rows = rows[:max_rows]
+    return pd.DataFrame(rows)
 
 
 def run_segmentation_inference(
@@ -880,6 +1229,310 @@ def run_quantized(
     return metrics_df, chart_fig, downloads
 
 
+def run_pruned_detection(
+    img,
+    model_choice,
+    method,
+    amount,
+    device_choice="auto",
+    channels_last=False,
+    use_compile=False,
+    use_amp=False,
+    export_ts=False,
+    export_onnx=False,
+    export_report=False,
+    export_state=True,
+    preset=None,
+    score_thresh=0.25,
+):
+    print("\n=== RUN DETECTION PRUNED CALLED ===")
+    if img is None:
+        print("ERROR: Image is None")
+        empty_metrics = pd.DataFrame({"Metric": ["Error"], "Original Model": ["No image"], "Pruned Model": [""]})
+        return empty_metrics, None, pd.DataFrame(), []
+
+    if preset in PRESETS:
+        preset_cfg = PRESETS[preset]
+        device_choice = preset_cfg["device"]
+        channels_last = preset_cfg["channels_last"]
+        use_compile = preset_cfg["compile"]
+        use_amp = preset_cfg.get("amp", use_amp)
+        amount = preset_cfg.get("prune_amount", amount)
+
+    device = select_device(device_choice)
+    cfg = get_detection_config(model_choice)
+    backend = cfg.get("backend", "torchvision")
+    imgsz = cfg.get("imgsz")
+    labels = get_detection_labels(model_choice)
+    transform_fn = get_detection_transform(model_choice)
+
+    base_model = get_detection_model(model_choice)
+    original_result = run_detection_inference(
+        base_model,
+        img,
+        device,
+        transform_fn,
+        channels_last=channels_last,
+        warmup=True,
+        use_amp=use_amp,
+        score_thresh=score_thresh,
+        backend=backend,
+        imgsz=imgsz,
+    )
+    original_result["detections"] = attach_detection_labels(original_result["detections"], labels)
+
+    fresh_model = clone_detection_model(model_choice)
+    pruned_module = apply_pruning(get_detection_state_module(fresh_model, backend), amount=float(amount), method=method)
+    pruned_module = maybe_compile(pruned_module, use_compile)
+    if backend == "ultralytics" and hasattr(fresh_model, "model"):
+        fresh_model.model = pruned_module
+        pruned_model = fresh_model
+    else:
+        pruned_model = pruned_module
+    pruned_result = run_detection_inference(
+        pruned_model,
+        img,
+        device,
+        transform_fn,
+        channels_last=channels_last,
+        warmup=True,
+        use_amp=use_amp,
+        score_thresh=score_thresh,
+        backend=backend,
+        imgsz=imgsz,
+    )
+    pruned_result["detections"] = attach_detection_labels(pruned_result["detections"], labels)
+
+    size_orig = get_state_dict_size_mb(get_detection_state_module(base_model, backend))
+    size_pruned = get_state_dict_size_mb(get_detection_state_module(pruned_model, backend))
+
+    metrics_df = build_detection_metrics(
+        original_result, pruned_result, size_orig, size_pruned, "Pruned Model", score_thresh
+    )
+    det_df = build_detection_comparison_df(original_result["detections"], pruned_result["detections"], "Pruned")
+    overlay_slider_value = (
+        draw_detections(original_result["image"], original_result["detections"]),
+        draw_detections(pruned_result["image"], pruned_result["detections"]),
+    )
+
+    downloads: list[str] = []
+    export_dir = Path("exports")
+    export_dir.mkdir(exist_ok=True)
+    trace_inputs = None
+
+    if backend != "ultralytics":
+        sample_tensor, _ = prepare_detection_input(img, transform_fn)
+        sample_batch = [sample_tensor]
+        trace_inputs = (sample_batch,)
+    else:
+        if export_ts or export_onnx:
+            print("TorchScript/ONNX export is not enabled for YOLO12 models in this app.")
+            export_ts = False
+            export_onnx = False
+
+    if export_report:
+        report_path = export_dir / "pruned_det_report.json"
+        report = {
+            "model": model_choice,
+            "pruning": {"method": method, "amount": float(amount)},
+            "score_threshold": score_thresh,
+            "metrics": metrics_df.to_dict(),
+            "detections": {
+                "original": original_result["detections"],
+                "pruned": pruned_result["detections"],
+            },
+        }
+        report_path.write_text(json.dumps(report, indent=2))
+        downloads.append(str(report_path))
+
+    if export_state:
+        state_path = export_dir / "pruned_det_state_dict.pth"
+        torch.save(get_detection_state_module(pruned_model, backend).state_dict(), state_path)
+        downloads.append(str(state_path))
+
+    if export_ts and trace_inputs is not None:
+        ts_path = export_dir / "pruned_det_model.ts"
+        try:
+            scripted = torch.jit.trace(pruned_model.cpu(), trace_inputs)
+            scripted.save(ts_path)
+            downloads.append(str(ts_path))
+        except Exception as exc:  # pragma: no cover - export best effort
+            print(f"TorchScript export failed: {exc}")
+
+    if export_onnx and trace_inputs is not None:
+        onnx_path = export_dir / "pruned_det_model.onnx"
+        try:
+            torch.onnx.export(
+                pruned_model.cpu(),
+                trace_inputs,
+                onnx_path,
+                input_names=["images"],
+                output_names=["detections"],
+                opset_version=13,
+                dynamic_axes={"images": {0: "batch", 2: "height", 3: "width"}},
+            )
+            downloads.append(str(onnx_path))
+        except Exception as exc:  # pragma: no cover - export best effort
+            print(f"ONNX export failed: {exc}")
+
+    print("=== RUN DETECTION PRUNED COMPLETE ===")
+    return metrics_df, overlay_slider_value, det_df, downloads
+
+
+def run_quantized_detection(
+    img,
+    model_choice,
+    q_type,
+    device_choice="auto",
+    channels_last=False,
+    use_compile=False,
+    use_amp=False,
+    export_ts=False,
+    export_onnx=False,
+    export_report=False,
+    export_state=True,
+    preset=None,
+    score_thresh=0.25,
+):
+    print("\n=== RUN DETECTION QUANTIZED CALLED ===")
+    if img is None:
+        print("ERROR: Image is None")
+        empty_metrics = pd.DataFrame({"Metric": ["Error"], "Original Model": ["No image"], "Quantized Model": [""]})
+        return empty_metrics, None, pd.DataFrame(), []
+
+    if preset in PRESETS:
+        preset_cfg = PRESETS[preset]
+        device_choice = preset_cfg["device"]
+        channels_last = preset_cfg["channels_last"]
+        use_compile = preset_cfg["compile"]
+        use_amp = preset_cfg.get("amp", use_amp)
+        q_type = preset_cfg.get("quant", q_type)
+
+    device = select_device(device_choice)
+    if q_type in {"dynamic", "weight_only"} and device.type != "cpu":
+        print("Dynamic/weight-only quantization uses CPU kernels; switching device to CPU.")
+        device = torch.device("cpu")
+        channels_last = False
+        use_amp = False
+    cfg = get_detection_config(model_choice)
+    backend = cfg.get("backend", "torchvision")
+    imgsz = cfg.get("imgsz")
+
+    labels = get_detection_labels(model_choice)
+    transform_fn = get_detection_transform(model_choice)
+    base_model = get_detection_model(model_choice)
+
+    original_result = run_detection_inference(
+        base_model,
+        img,
+        device,
+        transform_fn,
+        channels_last=channels_last,
+        warmup=True,
+        use_amp=use_amp,
+        score_thresh=score_thresh,
+        backend=backend,
+        imgsz=imgsz,
+    )
+    original_result["detections"] = attach_detection_labels(original_result["detections"], labels)
+
+    fresh_model = clone_detection_model(model_choice)
+    quant_module = apply_quantization(get_detection_state_module(fresh_model, backend), q_type)
+    quant_module = maybe_compile(quant_module, use_compile)
+    if backend == "ultralytics" and hasattr(fresh_model, "model"):
+        fresh_model.model = quant_module
+        quant_model = fresh_model
+    else:
+        quant_model = quant_module
+    quant_result = run_detection_inference(
+        quant_model,
+        img,
+        device,
+        transform_fn,
+        channels_last=channels_last,
+        warmup=True,
+        use_amp=use_amp,
+        score_thresh=score_thresh,
+        backend=backend,
+        imgsz=imgsz,
+    )
+    quant_result["detections"] = attach_detection_labels(quant_result["detections"], labels)
+
+    size_orig = get_state_dict_size_mb(get_detection_state_module(base_model, backend))
+    size_quant = get_state_dict_size_mb(get_detection_state_module(quant_model, backend))
+    metrics_df = build_detection_metrics(
+        original_result, quant_result, size_orig, size_quant, "Quantized Model", score_thresh
+    )
+    det_df = build_detection_comparison_df(original_result["detections"], quant_result["detections"], "Quantized")
+    overlay_slider_value = (
+        draw_detections(original_result["image"], original_result["detections"]),
+        draw_detections(quant_result["image"], quant_result["detections"]),
+    )
+
+    downloads: list[str] = []
+    export_dir = Path("exports")
+    export_dir.mkdir(exist_ok=True)
+    trace_inputs = None
+
+    if backend != "ultralytics":
+        sample_tensor, _ = prepare_detection_input(img, transform_fn)
+        sample_batch = [sample_tensor]
+        trace_inputs = (sample_batch,)
+    else:
+        if export_ts or export_onnx:
+            print("TorchScript/ONNX export is not enabled for YOLO12 models in this app.")
+            export_ts = False
+            export_onnx = False
+
+    if export_report:
+        report_path = export_dir / "quant_det_report.json"
+        report = {
+            "model": model_choice,
+            "quantization": q_type,
+            "score_threshold": score_thresh,
+            "metrics": metrics_df.to_dict(),
+            "detections": {
+                "original": original_result["detections"],
+                "quantized": quant_result["detections"],
+            },
+        }
+        report_path.write_text(json.dumps(report, indent=2))
+        downloads.append(str(report_path))
+
+    if export_state:
+        state_path = export_dir / "quant_det_state_dict.pth"
+        torch.save(get_detection_state_module(quant_model, backend).state_dict(), state_path)
+        downloads.append(str(state_path))
+
+    if export_ts and trace_inputs is not None:
+        ts_path = export_dir / "quant_det_model.ts"
+        try:
+            scripted = torch.jit.trace(quant_model.cpu(), trace_inputs)
+            scripted.save(ts_path)
+            downloads.append(str(ts_path))
+        except Exception as exc:  # pragma: no cover - export best effort
+            print(f"TorchScript export failed: {exc}")
+
+    if export_onnx and trace_inputs is not None:
+        onnx_path = export_dir / "quant_det_model.onnx"
+        try:
+            torch.onnx.export(
+                quant_model.cpu(),
+                trace_inputs,
+                onnx_path,
+                input_names=["images"],
+                output_names=["detections"],
+                opset_version=13,
+                dynamic_axes={"images": {0: "batch", 2: "height", 3: "width"}},
+            )
+            downloads.append(str(onnx_path))
+        except Exception as exc:  # pragma: no cover - export best effort
+            print(f"ONNX export failed: {exc}")
+
+    print("=== RUN DETECTION QUANTIZED COMPLETE ===")
+    return metrics_df, overlay_slider_value, det_df, downloads
+
+
 def run_pruned_segmentation(
     img,
     model_choice,
@@ -1199,6 +1852,7 @@ def create_demo():
             device_opts.append("mps")
         preset_opts = list(PRESETS.keys()) + ["custom"]
         seg_model_options = [cfg.name for cfg in SEGMENTATION_MODEL_CONFIGS]
+        det_model_options = DETECTION_MODEL_OPTIONS.copy()
 
         with gr.Tabs():
             # ---- PRUNING TAB ----
@@ -1343,6 +1997,136 @@ def create_demo():
                         preset_q,
                     ],
                     outputs=[metrics_q, chart_q, downloads_q],
+                )
+
+            # ---- DETECTION PRUNING TAB ----
+            with gr.Tab("Pruning-Detection"):
+                with gr.Row():
+                    with gr.Column():
+                        img_dp = gr.Image(label="Upload Image")
+                        model_dp = gr.Dropdown(det_model_options, value=det_model_options[0], label="Object Detector (COCO)")
+                        preset_dp = gr.Dropdown(preset_opts, value="custom", label="Hardware Preset")
+                        method_dp = gr.Dropdown(["unstructured", "structured"], value="structured", label="Pruning Method")
+                        amount_dp = gr.Slider(minimum=0.1, maximum=0.9, step=0.1, value=0.3, label="Pruning Amount")
+                        score_dp = gr.Slider(minimum=0.05, maximum=0.9, step=0.05, value=0.25, label="Score Threshold")
+                        device_dp = gr.Dropdown(device_opts, value=device_opts[0], label="Device")
+                        channels_last_dp = gr.Checkbox(label="Channels-last input (CUDA)", value=True)
+                        amp_dp = gr.Checkbox(label="Mixed precision (AMP)", value=True)
+                        compile_dp = gr.Checkbox(label="Torch compile (PyTorch 2)")
+                        export_ts_dp = gr.Checkbox(label="Export TorchScript")
+                        export_onnx_dp = gr.Checkbox(label="Export ONNX")
+                        export_report_dp = gr.Checkbox(label="Export JSON report", value=True)
+                        btn_dp = gr.Button("Run Detection Pruning")
+                        gr.Examples(examples=examples, inputs=img_dp)
+                        gr.Markdown(
+                            "### 🦾 Detection Pruning Guide\n\n"
+                            "**Models:**\n"
+                            "- TorchVision: Faster R-CNN ResNet50 FPN, SSDlite320 MobileNetV3 (COCO pretrained)\n"
+                            "- Ultralytics YOLO12: sizes n/s/m/l/x (COCO, auto-downloaded if missing)\n\n"
+                            "**Core Options:**\n"
+                            "- *Hardware Preset*: Same CPU/GPU defaults as classification; channels-last only applies on CUDA.\n"
+                            "- *Pruning Method*: Structured is safest for detection heads; unstructured yields higher sparsity but rarely speeds up NMS.\n"
+                            "- *Score Threshold*: Filters low-confidence boxes before metrics/overlays.\n"
+                            "- *AMP / Torch Compile*: Only useful on GPU; compile adds startup cost but can speed up steady-state.\n"
+                            "- *YOLO12 exports*: TorchScript/ONNX disabled here; state_dict still saved for the underlying torch model.\n\n"
+                            "**Reading Results:**\n"
+                            "- Metrics: latency, box count above threshold, mean score, model size.\n"
+                            "- Overlay slider: drag to compare original vs pruned detections.\n"
+                            "- Detections table: flattened list of boxes for quick scanning."
+                        )
+
+                    with gr.Column():
+                        metrics_dp = gr.Dataframe(label="📊 Detection Metrics", headers=["Metric", "Original Model", "Pruned Model"])
+                        overlay_dp = gr.ImageSlider(label="Overlay Comparison", type="pil")
+                        dets_dp = gr.Dataframe(label="Detections (Original vs Pruned)")
+                        downloads_dp = gr.Files(label="Exports (state_dict / TorchScript / ONNX / report)")
+
+                btn_dp.click(
+                    fn=run_pruned_detection,
+                    inputs=[
+                        img_dp,
+                        model_dp,
+                        method_dp,
+                        amount_dp,
+                        device_dp,
+                        channels_last_dp,
+                        compile_dp,
+                        amp_dp,
+                        export_ts_dp,
+                        export_onnx_dp,
+                        export_report_dp,
+                        gr.State(True),
+                        preset_dp,
+                        score_dp,
+                    ],
+                    outputs=[
+                        metrics_dp,
+                        overlay_dp,
+                        dets_dp,
+                        downloads_dp,
+                    ],
+                )
+
+            # ---- DETECTION QUANTIZATION TAB ----
+            with gr.Tab("Quantization-Detection"):
+                with gr.Row():
+                    with gr.Column():
+                        img_dq = gr.Image(label="Upload Image")
+                        model_dq = gr.Dropdown(det_model_options, value=det_model_options[0], label="Object Detector (COCO)")
+                        preset_dq = gr.Dropdown(preset_opts, value="custom", label="Hardware Preset")
+                        q_type_dq = gr.Dropdown(["dynamic", "weight_only", "fp16"], value="dynamic", label="Quantization Type")
+                        score_dq = gr.Slider(minimum=0.05, maximum=0.9, step=0.05, value=0.25, label="Score Threshold")
+                        device_dq = gr.Dropdown(device_opts, value=device_opts[0], label="Device")
+                        channels_last_dq = gr.Checkbox(label="Channels-last input (CUDA)", value=True)
+                        amp_dq = gr.Checkbox(label="Mixed precision (AMP)", value=True)
+                        compile_dq = gr.Checkbox(label="Torch compile (PyTorch 2)")
+                        export_ts_dq = gr.Checkbox(label="Export TorchScript")
+                        export_onnx_dq = gr.Checkbox(label="Export ONNX")
+                        export_report_dq = gr.Checkbox(label="Export JSON report", value=True)
+                        btn_dq = gr.Button("Run Detection Quantization")
+                        gr.Examples(examples=examples, inputs=img_dq)
+                        gr.Markdown(
+                            "### ⚡ Detection Quantization Guide\n\n"
+                            "**Models:** TorchVision detectors and YOLO12 n/s/m/l/x (Ultralytics). YOLO12 uses its internal preprocessing; other models use TorchVision transforms.\n\n"
+                            "**Quantization Modes:**\n"
+                            "- *Dynamic / Weight-only*: INT8 linear layers on CPU. UI auto-switches to CPU even if GPU selected (PyTorch limitation).\n"
+                            "- *FP16*: Half precision for CUDA/MPS; keeps CPU in FP32. Pair with AMP + channels-last for best GPU speed.\n\n"
+                            "**Tips:**\n"
+                            "- Score threshold trims noisy boxes before metrics/overlays.\n"
+                            "- TorchScript/ONNX exports are skipped for YOLO12; state_dict still saved. TorchVision exports remain enabled.\n"
+                            "- For fastest runs, keep AMP + channels-last on CUDA; disable compile if you only run a single image.\n\n"
+                            "**Outputs:** Metrics table, overlay slider, detections table, and exports in `exports/` with `_det` suffix."
+                        )
+
+                    with gr.Column():
+                        metrics_dq = gr.Dataframe(label="📊 Detection Metrics", headers=["Metric", "Original Model", "Quantized Model"])
+                        overlay_dq = gr.ImageSlider(label="Overlay Comparison", type="pil")
+                        dets_dq = gr.Dataframe(label="Detections (Original vs Quantized)")
+                        downloads_dq = gr.Files(label="Exports (state_dict / TorchScript / ONNX / report)")
+
+                btn_dq.click(
+                    fn=run_quantized_detection,
+                    inputs=[
+                        img_dq,
+                        model_dq,
+                        q_type_dq,
+                        device_dq,
+                        channels_last_dq,
+                        compile_dq,
+                        amp_dq,
+                        export_ts_dq,
+                        export_onnx_dq,
+                        export_report_dq,
+                        gr.State(True),
+                        preset_dq,
+                        score_dq,
+                    ],
+                    outputs=[
+                        metrics_dq,
+                        overlay_dq,
+                        dets_dq,
+                        downloads_dq,
+                    ],
                 )
 
             # ---- SEGMENTATION PRUNING TAB ----

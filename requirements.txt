@@ -5,6 +5,7 @@ timm>=0.9.12
 segmentation-models-pytorch>=0.3.3
 huggingface-hub>=0.23.0
 albumentations>=1.4.8
+ultralytics>=8.3.0  # YOLO12 detection backends
 
 # UI
 gradio>=4.19.2

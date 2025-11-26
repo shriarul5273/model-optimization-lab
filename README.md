@@ -11,16 +11,18 @@ pinned: false
 
 # Model Optimization Lab
 
-Interactive Gradio playground for comparing pruning and quantization on both ImageNet-classification and ADE20K-segmentation models. Upload any image and observe how latency, confidence, model size, and segmentation quality change when applying different compression recipes. Pretrained weights are loaded by default; set `MODEL_OPT_PRETRAINED=0` if you want random initialization for experimentation.
+Interactive Gradio playground for comparing pruning and quantization on ImageNet classification, ADE20K segmentation, and COCO detection models (TorchVision + YOLO12). Upload any image and observe how latency, confidence, model size, and segmentation/detection quality change when applying different compression recipes. Pretrained weights are loaded by default; set `MODEL_OPT_PRETRAINED=0` if you want random initialization for experimentation.
 
 ## Features
 - **Classification Tasks**: Baseline FP32 inference using cached backbones (ResNet-50, MobileNetV3, EfficientNet-B0, ConvNeXt-Tiny, ViT-B/16, RegNetY-016, EfficientNet-Lite0).
 - **Segmentation Tasks**: Pretrained ADE20K models (SegFormer B0/B4, DPT Large, UPerNet ConvNeXt-Tiny) with 150-class semantic segmentation.
-- **Pruning tabs**: Structured/unstructured pruning with configurable sparsity and comprehensive size/latency comparison for both classification and segmentation.
-- **Quantization tabs**: Dynamic, weight-only INT8, and FP16 passes with CPU-safe fallbacks for unsupported kernels, available for both task types.
+- **Detection Tasks**: COCO-pretrained detectors (TorchVision Faster R-CNN/SSDlite) plus Ultralytics YOLO12 n/s/m/l/x.
+- **Pruning tabs**: Structured/unstructured pruning with configurable sparsity and comprehensive size/latency comparison across tasks.
+- **Quantization tabs**: Dynamic, weight-only INT8, and FP16 passes with CPU-safe fallbacks for unsupported kernels, available for all tasks.
 - **Visual Comparisons**: 
   - Classification: Automated metric tables and Top-5 bar charts to visualize confidence shifts.
   - Segmentation: Image sliders for overlay/mask comparisons, class distribution tables, and mask agreement metrics.
+  - Detection: Overlay sliders for pruned/quantized boxes and detection tables for quick inspection.
 - **Export Options**: TorchScript, ONNX, JSON reports, and state dictionaries for all optimization variants.
 - Lightweight CLI mode for quick experiments without launching the UI.
 
@@ -53,15 +55,16 @@ Interactive Gradio playground for comparing pruning and quantization on both Ima
 5. Open the local Gradio URL (printed in the terminal) in your browser.
 
 ## Using the App
-1. **Upload an image** or pick one of the provided examples (ImageNet samples for classification, ADE20K validation images for segmentation).
+1. **Upload an image** or pick one of the provided examples (ImageNet samples for classification, ADE20K validation images for segmentation; detection works with any RGB image).
 2. Choose the **Base Model** dropdown:
    - **Classification**: ResNet-50, MobileNetV3-Large, EfficientNet-B0, ConvNeXt-Tiny, ViT-B/16, RegNetY-016, EfficientNet-Lite0
    - **Segmentation**: SegFormer B0/B4 (ADE20K 512x512), DPT Large (ADE20K), UPerNet ConvNeXt-Tiny (ADE20K)
+   - **Detection**: Faster R-CNN ResNet50 FPN (COCO), SSDlite320 MobileNetV3 (COCO), YOLO12 n/s/m/l/x (COCO via Ultralytics)
 3. Pick a **Hardware Preset** or keep `custom`:
 	- Edge CPU — CPU, channels-last off, dynamic quantization, 30% pruning.
 	- Datacenter GPU — CUDA, channels-last on, `torch.compile`, FP16 quantization, 20% pruning.
 	- Apple MPS — MPS, FP16 quantization, 20% pruning.
-4. Select a tab (Pruning-Classification, Quantization-Classification, Pruning-Segmentation, or Quantization-Segmentation), configure options, then click **Run**.
+4. Select a tab (Pruning/Quantization for Classification, Detection, or Segmentation), configure options, then click **Run**.
 
 ### Pruning tab options (Classification & Segmentation)
 - `Pruning Method`: `structured` (LN-structured) or `unstructured` (L1). Applied to Conv2d weights before export.
@@ -76,6 +79,13 @@ Interactive Gradio playground for comparing pruning and quantization on both Ima
 - **Outputs**:
   - Classification: Comparison metrics, Top-5 bar chart, per-layer sparsity table, download list
   - Segmentation: Comparison metrics, class distribution table, overlay/mask sliders, per-layer sparsity table, download list
+
+### Detection tab options (Pruning & Quantization)
+- `Models`: TorchVision Faster R-CNN / SSDlite, plus Ultralytics YOLO12 n/s/m/l/x (auto-downloads checkpoints if missing).
+- `Score Threshold`: Filters low-confidence boxes before metrics/overlays.
+- `Pruning`: Structured recommended for detection heads; unstructured yields higher sparsity but fewer real speedups.
+- `Quantization`: Dynamic/weight-only INT8 forces CPU for kernel support; FP16 targets CUDA/MPS. AMP + channels-last help on GPU.
+- `Exports`: State dicts always saved. TorchScript/ONNX exports remain enabled for TorchVision detectors; YOLO12 exports are skipped (TorchScript/ONNX) but state dict is still written.
 
 ### Quantization tab options (Classification & Segmentation)
 - `Quantization Type`: `dynamic`/`weight_only` (INT8 linear layers on CPU), or `fp16` (casts model to half precision).
@@ -108,6 +118,7 @@ Interactive Gradio playground for comparing pruning and quantization on both Ima
 - Dynamic and weight-only quantization only affect linear layers; ResNet-50 is dominated by convolution blocks that remain FP32, so speedups are modest on CPU. Unsupported static INT8 kernels automatically fall back to dynamic quantization.
 - PyTorch default quantization backend may fall back to `qnnpack` on CPU. For x86 systems, set `torch.backends.quantized.engine = "fbgemm"` before quantization for best results.
 - FP16 inference is beneficial on GPUs. On CPU, PyTorch often casts half tensors back to float32, introducing overhead.
+- Detection-specific: Dynamic/weight-only runs force CPU for kernel support; YOLO12 checkpoints auto-download but TorchScript/ONNX exports are disabled (state dicts still save).
 
 ## Extending the Lab
 - **Classification**: Swap in different architectures by changing the `timm.create_model` call in `app.py`.
