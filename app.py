@@ -1310,9 +1310,17 @@ def run_pruned_detection(
         original_result, pruned_result, size_orig, size_pruned, "Pruned Model", score_thresh
     )
     det_df = build_detection_comparison_df(original_result["detections"], pruned_result["detections"], "Pruned")
-    overlay_slider_value = (
+    overlay_orig = add_image_label(
         draw_detections(original_result["image"], original_result["detections"]),
+        "Original Model",
+    )
+    overlay_pruned = add_image_label(
         draw_detections(pruned_result["image"], pruned_result["detections"]),
+        "Pruned Model",
+    )
+    overlay_slider_value = (
+        overlay_orig,
+        overlay_pruned,
     )
 
     downloads: list[str] = []
@@ -1464,9 +1472,17 @@ def run_quantized_detection(
         original_result, quant_result, size_orig, size_quant, "Quantized Model", score_thresh
     )
     det_df = build_detection_comparison_df(original_result["detections"], quant_result["detections"], "Quantized")
-    overlay_slider_value = (
+    overlay_orig = add_image_label(
         draw_detections(original_result["image"], original_result["detections"]),
+        "Original Model",
+    )
+    overlay_quant = add_image_label(
         draw_detections(quant_result["image"], quant_result["detections"]),
+        "Quantized Model",
+    )
+    overlay_slider_value = (
+        overlay_orig,
+        overlay_quant,
     )
 
     downloads: list[str] = []
@@ -2340,7 +2356,7 @@ def main():
         return
 
     demo = create_demo()
-    demo.launch()
+    demo.launch(theme = gr.themes.Soft())
 
 
 if __name__ == "__main__":
