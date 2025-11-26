@@ -1185,7 +1185,7 @@ def run_quantized_segmentation(
 # GRADIO UI
 # ---------------------------------------------
 examples = [["examples/cat.jpg"], ["examples/dog.jpg"], ["examples/bird.jpg"], ["examples/car.jpg"], ["examples/elephant.jpg"]]
-ade_examples = [["examples/ADE_val_00000001.jpg"], ["examples/ADE_val_00000002.jpg"], ["examples/ADE_val_00001001.jpg"], ["examples/ADE_val_00001842.jpg"]]
+ade_examples = [["examples/ADE_val_00000001.jpg"], ["examples/ADE_val_00000002.jpg"]]
 
 
 def create_demo():
